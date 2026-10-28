@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
@@ -40,13 +41,28 @@ from backend.db import get_db, init_db, SessionLocal
 from backend.workflow.ai_simulation import simulate_and_execute_run
 from backend.healing.gemma_simulator import gemma_is_configured
 
-app = FastAPI(title="PS4 Self-Healing Workflow Engine", version="1.0.0", description="AI-assisted, policy-governed recovery for business workflows.")
+app = FastAPI(
+    title="PS4 Self-Healing Workflow Engine",
+    version="1.0.0",
+    description="AI-assisted, policy-governed recovery for business workflows.",
+)
+
+# Local development origins
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://code-e-fiesta-26-project.vercel.app",
+]
+
+# Add the deployed frontend URL from the environment
+frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+
+if frontend_url and frontend_url not in allowed_origins:
+    allowed_origins.append(frontend_url)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
