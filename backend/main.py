@@ -1,6 +1,5 @@
 import json
 import os
-from datetime import datetime, timezone
 from typing import Any
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,12 +7,9 @@ from pydantic import EmailStr, TypeAdapter, ValidationError
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 from backend.observability import add_event
-from backend.workflow.pipeline import reject_incident
-from backend.config import (
-    FRONTEND_ORIGIN,
-    GEMMA_API_KEY,
-    GEMMA_MODEL_ID,
-)
+from backend.workflow.pipeline import approve_and_retry, execute_run, reject_incident
+from backend.evaluation.benchmark import run_benchmark
+from backend.config import GEMMA_MODEL_ID
 from backend.workflow.injector import (
     DEFAULT_ORDER,
     FAILURE_TYPES,
@@ -140,6 +136,11 @@ def _incident_dict(db: Session, incident: Incident, include_events: bool = True)
         } for e in events]
     return result
 
+@app.get("/")
+def root():
+    return {"service": "HELIOS Self-Healing Workflow Engine", "status": "ok", "docs": "/docs", "health": "/health"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "ps4-self-healing"}
@@ -160,7 +161,7 @@ def ai_simulator_status():
 def metadata():
     return {"failure_types": FAILURE_TYPES, "workflow_steps": ["receive_order", "create_crm_record", "send_confirmation"], "modes": ["full", "rule_only", "retry_only"]}
 
-@app.post("/runs")
+@app.post("/runs", status_code=202)
 def create_run(
     body: RunCreate,
     background_tasks: BackgroundTasks,
@@ -221,43 +222,28 @@ def create_run(
     db.add(run)
     db.commit()
     db.refresh(run)
-    # Execute both predefined and Gemma-generated scenarios
-    # through the same existing healing engine.
-    try:
-        if is_gemma_simulation:
-            # Generates the synthetic fault and then calls execute_run().
-            simulate_and_execute_run(
-                run.id,
-                body.simulation_prompt,
-            )
-        else:
-            # Directly execute predefined scenarios.
-            execute_run(run.id)
-
-        # Reload the state written by the executor's database session.
-        db.refresh(run)
-
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Workflow execution failed: {str(exc)[:1000]}",
-        ) from exc
-
-    if run.status == "PENDING_APPROVAL":
-        message = "Run requires human approval."
-    elif run.status in ("RECOVERED", "SUCCEEDED"):
-        message = "Workflow execution completed successfully."
-    elif run.status in ("ERROR", "ESCALATED"):
-        message = run.error or "Workflow failed or was escalated."
+    # Both paths are scheduled as background tasks. This keeps the API responsive
+    # while execute_run performs the same validated workflow and recovery logic.
+    if is_gemma_simulation:
+        background_tasks.add_task(
+            simulate_and_execute_run,
+            run.id,
+            body.simulation_prompt,
+        )
+        message = (
+            "Gemma scenario generation queued. Poll GET /runs/{run_id} "
+            "for the scenario and result."
+        )
     else:
-        message = f"Workflow finished with status: {run.status}"
+        background_tasks.add_task(execute_run, run.id)
+        message = "Run queued. Poll GET /runs/{run_id} for progress."
 
     return {
         "run_id": run.id,
         "status": run.status,
         "message": message,
     }
+
 @app.get("/runs")
 def list_runs(limit: int = 30, db: Session = Depends(get_db)):
     limit = max(1, min(limit, 100))
