@@ -160,7 +160,7 @@ def ai_simulator_status():
 def metadata():
     return {"failure_types": FAILURE_TYPES, "workflow_steps": ["receive_order", "create_crm_record", "send_confirmation"], "modes": ["full", "rule_only", "retry_only"]}
 
-@app.post("/runs", status_code=202)
+@app.post("/runs")
 def create_run(
     body: RunCreate,
     background_tasks: BackgroundTasks,
@@ -221,21 +221,37 @@ def create_run(
     db.add(run)
     db.commit()
     db.refresh(run)
+    # Execute both predefined and Gemma-generated scenarios
+    # through the same existing healing engine.
+    try:
+        if is_gemma_simulation:
+            # Generates the synthetic fault and then calls execute_run().
+            simulate_and_execute_run(
+                run.id,
+                body.simulation_prompt,
+            )
+        else:
+            # Directly execute predefined scenarios.
+            execute_run(run.id)
 
-    if is_gemma_simulation:
-        background_tasks.add_task(
-            simulate_and_execute_run,
-            run.id,
-            body.simulation_prompt,
-        )
+        # Reload the state written by the executor's database session.
+        db.refresh(run)
 
-        message = (
-            "Gemma scenario generation queued. "
-            "Poll GET /runs/{run_id} for the scenario and result."
-        )
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Workflow execution failed: {str(exc)[:1000]}",
+        ) from exc
+
+    if run.status == "PENDING_APPROVAL":
+        message = "Run requires human approval."
+    elif run.status in ("RECOVERED", "SUCCEEDED"):
+        message = "Workflow execution completed successfully."
+    elif run.status in ("ERROR", "ESCALATED"):
+        message = run.error or "Workflow failed or was escalated."
     else:
-        background_tasks.add_task(execute_run, run.id)
-        message = "Run queued."
+        message = f"Workflow finished with status: {run.status}"
 
     return {
         "run_id": run.id,
