@@ -15,6 +15,9 @@ from backend.healing.patch_ops import apply_patch_ops
 from backend.healing.validator import validate_patch
 from backend.healing.repair_proof import verify_repair
 from backend.memory.repair_memory import save_verified_repair
+import logging
+
+logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 2
 
@@ -68,38 +71,102 @@ def _execute_steps(db: Session, run: Run, payload: dict[str, Any], attempt: int)
         return False, "send_confirmation", str(exc)
     return True, None, None
 
-def execute_run(run_id: int, mode: str = "full", simulated_approval_value: str | None = None) -> None:
+def execute_run(
+    run_id: int,
+    mode: str = "full",
+    simulated_approval_value: str | None = None,
+) -> None:
     """Background task entrypoint. Modes: full, rule_only, retry_only."""
-    db = SessionLocal()
+
+    logger.info(
+        "Regular workflow executor started: run_id=%s, mode=%s",
+        run_id,
+        mode,
+    )
+
+    db = None
+
     try:
+        # Create the database session inside try so failures are logged.
+        db = SessionLocal()
+
         run = db.get(Run, run_id)
+
         if not run:
+            logger.error("Run %s was not found in the database", run_id)
             return
+
         run.status = "RUNNING"
         run.started_at = now_utc()
         db.commit()
+
+        logger.info("Run %s transitioned to RUNNING", run_id)
+
         payload = json.loads(run.payload_json)
-        succeeded, failed_step, error = _execute_steps(db, run, payload, attempt=1)
+
+        succeeded, failed_step, error = _execute_steps(
+            db,
+            run,
+            payload,
+            attempt=1,
+        )
+
         if succeeded:
             run = db.get(Run, run_id)
-            run.status = "SUCCEEDED"
-            run.ended_at = now_utc()
-            run.error = None
-            db.commit()
-            return
-        run = db.get(Run, run_id)
-        _handle_failure(db, run, payload, failed_step or "unknown", error or "Unknown failure", mode, simulated_approval_value)
-    except Exception as exc:
-        db.rollback()
-        run = db.get(Run, run_id)
-        if run:
-            run.status = "ERROR"
-            run.error = str(exc)
-            run.ended_at = now_utc()
-            db.commit()
-    finally:
-        db.close()
 
+            if run:
+                run.status = "SUCCEEDED"
+                run.ended_at = now_utc()
+                run.error = None
+                db.commit()
+
+            logger.info("Run %s completed successfully", run_id)
+            return
+
+        run = db.get(Run, run_id)
+
+        if run:
+            _handle_failure(
+                db,
+                run,
+                payload,
+                failed_step or "unknown",
+                error or "Unknown failure",
+                mode,
+                simulated_approval_value,
+            )
+
+            logger.info(
+                "Run %s handed to failure handler; failed_step=%s",
+                run_id,
+                failed_step,
+            )
+
+    except Exception as exc:
+        logger.exception("Regular workflow failed: run_id=%s", run_id)
+
+        if db is not None:
+            try:
+                db.rollback()
+
+                run = db.get(Run, run_id)
+
+                if run:
+                    run.status = "ERROR"
+                    run.error = str(exc)
+                    run.ended_at = now_utc()
+                    db.commit()
+
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Could not persist error status for run_id=%s",
+                    run_id,
+                )
+
+    finally:
+        if db is not None:
+            db.close()
 def _handle_failure(db: Session, run: Run, payload: dict[str, Any], failed_step: str, error: str,
                     mode: str, simulated_approval_value: str | None = None) -> None:
     incident = Incident(run_id=run.id, failed_step=failed_step, status="DETECTED", error=error)
